@@ -4,8 +4,11 @@ import json
 import os
 import threading
 import time
+import numpy as np
 from pydub import AudioSegment
 from pynput.keyboard import Key, Listener
+
+pa = None
 
 # 로깅 설정: 파일과 콘솔 모두에 로그를 남길 수 있도록 설정
 logging.basicConfig(
@@ -46,28 +49,66 @@ for k, file_path in key_to_mp3.items():
     except Exception as e:
         logging.error(f"Failed to preload audio for key {k} from file {file_path}: {e}")
 
-def play_audio(audio, start_time=None):
-    """
-    pyaudio를 통해 preloaded audio segment를 재생합니다.
-    """
-    if start_time is not None:
-        delay = time.time() - start_time
-        logging.info(f"Audio playback delay: {delay:.4f} seconds")
+# 전역 PyAudio 초기화
+pa = pyaudio.PyAudio()
+active_audio_segments = []
+active_audio_lock = threading.Lock()
 
-    try:
-        p = pyaudio.PyAudio()
-        stream = p.open(format=p.get_format_from_width(audio.sample_width),
-                        channels=audio.channels,
-                        rate=audio.frame_rate,
-                        output=True)
-
-        stream.write(audio.raw_data)
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-    except Exception as e:
-        logging.error(f"Audio playback failed: {e}")
+def mixer_thread():
+    # Determine output audio parameters using defaults or the first loaded audio
+    sample_width = 2
+    channels = 2
+    rate = 44100
+    if key_to_audio:
+        first_audio = next(iter(key_to_audio.values()))
+        sample_width = first_audio.sample_width
+        channels = first_audio.channels
+        rate = first_audio.frame_rate
+    
+    stream = pa.open(
+        format=pa.get_format_from_width(sample_width),
+        channels=channels,
+        rate=rate,
+        output=True,
+        frames_per_buffer=256
+    )
+    
+    chunk_size = 256  # frames per buffer
+    while True:
+        with active_audio_lock:
+            if not active_audio_segments:
+                # Write silence if no active audio segments
+                silence = (np.zeros(chunk_size * channels, dtype=np.int16)).tobytes()
+                stream.write(silence)
+            else:
+                mixed_chunk = None
+                segments_to_remove = []
+                for segment in active_audio_segments:
+                    audio_seg = segment['audio']
+                    offset = segment['offset']
+                    bytes_per_frame = audio_seg.sample_width * audio_seg.channels
+                    chunk_byte_length = chunk_size * bytes_per_frame
+                    data_chunk = audio_seg.raw_data[offset:offset+chunk_byte_length]
+                    if len(data_chunk) < chunk_byte_length:
+                        data_chunk += b'\x00' * (chunk_byte_length - len(data_chunk))
+                        segments_to_remove.append(segment)
+                    # Convert the chunk to a numpy array (assuming 16-bit samples)
+                    chunk_array = np.frombuffer(data_chunk, dtype=np.int16)
+                    if mixed_chunk is None:
+                        mixed_chunk = chunk_array.astype(np.int32)
+                    else:
+                        mixed_chunk += chunk_array.astype(np.int32)
+                    # Update offset for this segment
+                    segment['offset'] += chunk_byte_length
+                # Remove finished segments
+                for seg in segments_to_remove:
+                    active_audio_segments.remove(seg)
+                if mixed_chunk is not None:
+                    # Clip to int16 range and write to stream
+                    mixed_chunk = np.clip(mixed_chunk, -32768, 32767).astype(np.int16)
+                    stream.write(mixed_chunk.tobytes())
+        # Small sleep to yield CPU if needed
+        time.sleep(0.001)
 
 def on_press(key):
     """
@@ -83,9 +124,9 @@ def on_press(key):
     logging.info(f"Key pressed: {k}")
 
     if k in key_to_audio:
-        logging.info(f"Playing preloaded audio for key: {k}")
-        start_time = time.time()
-        threading.Thread(target=play_audio, args=(key_to_audio[k], start_time), daemon=True).start()
+        logging.info(f"Queueing preloaded audio for key: {k}")
+        with active_audio_lock:
+            active_audio_segments.append({ 'audio': key_to_audio[k], 'offset': 0 })
     else:
         logging.info(f"No audio mapping for key: {k}")
 
@@ -98,6 +139,13 @@ def on_release(key):
     if key == Key.esc:
         return False  # 리스너 종료
 
+# Start the mixer thread
+mixer = threading.Thread(target=mixer_thread, daemon=True)
+mixer.start()
+
 # 키보드 이벤트 리스너 시작
 with Listener(on_press=on_press, on_release=on_release) as listener:
     listener.join()
+
+# 프로그램 종료 후 자원 정리
+pa.terminate()
