@@ -1,0 +1,4 @@
+pygame==2.6.1
+pynput==1.8.1
+pydub==0.25.1
+py2app==0.28.8 
