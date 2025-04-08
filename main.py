@@ -49,66 +49,63 @@ for k, file_path in key_to_mp3.items():
     except Exception as e:
         logging.error(f"Failed to preload audio for key {k} from file {file_path}: {e}")
 
+# Determine output audio parameters based on the first preloaded audio
+sample_width = 2
+channels = 2
+rate = 44100
+if key_to_audio:
+    first_audio = next(iter(key_to_audio.values()))
+    sample_width = first_audio.sample_width
+    channels = first_audio.channels
+    rate = first_audio.frame_rate
+
+# Define the callback for lower-latency audio mixing
+def audio_callback(in_data, frame_count, time_info, status):
+    with active_audio_lock:
+        if not active_audio_segments:
+            silence = (np.zeros(frame_count * channels, dtype=np.int16)).tobytes()
+            return (silence, pyaudio.paContinue)
+        else:
+            mixed_chunk = None
+            segments_to_remove = []
+            for segment in active_audio_segments:
+                audio_seg = segment['audio']
+                offset = segment['offset']
+                bytes_per_frame = audio_seg.sample_width * audio_seg.channels
+                chunk_byte_length = frame_count * bytes_per_frame
+                data_chunk = audio_seg.raw_data[offset:offset + chunk_byte_length]
+                if len(data_chunk) < chunk_byte_length:
+                    data_chunk += b'\x00' * (chunk_byte_length - len(data_chunk))
+                    segments_to_remove.append(segment)
+                chunk_array = np.frombuffer(data_chunk, dtype=np.int16)
+                if mixed_chunk is None:
+                    mixed_chunk = chunk_array.astype(np.int32)
+                else:
+                    mixed_chunk += chunk_array.astype(np.int32)
+                segment['offset'] += chunk_byte_length
+            for seg in segments_to_remove:
+                active_audio_segments.remove(seg)
+            if mixed_chunk is None:
+                silence = (np.zeros(frame_count * channels, dtype=np.int16)).tobytes()
+                return (silence, pyaudio.paContinue)
+            else:
+                mixed_chunk = np.clip(mixed_chunk, -32768, 32767).astype(np.int16)
+                return (mixed_chunk.tobytes(), pyaudio.paContinue)
+
 # 전역 PyAudio 초기화
 pa = pyaudio.PyAudio()
 active_audio_segments = []
 active_audio_lock = threading.Lock()
 
-def mixer_thread():
-    # Determine output audio parameters using defaults or the first loaded audio
-    sample_width = 2
-    channels = 2
-    rate = 44100
-    if key_to_audio:
-        first_audio = next(iter(key_to_audio.values()))
-        sample_width = first_audio.sample_width
-        channels = first_audio.channels
-        rate = first_audio.frame_rate
-    
-    stream = pa.open(
-        format=pa.get_format_from_width(sample_width),
-        channels=channels,
-        rate=rate,
-        output=True,
-        frames_per_buffer=256
-    )
-    
-    chunk_size = 256  # frames per buffer
-    while True:
-        with active_audio_lock:
-            if not active_audio_segments:
-                # Write silence if no active audio segments
-                silence = (np.zeros(chunk_size * channels, dtype=np.int16)).tobytes()
-                stream.write(silence)
-            else:
-                mixed_chunk = None
-                segments_to_remove = []
-                for segment in active_audio_segments:
-                    audio_seg = segment['audio']
-                    offset = segment['offset']
-                    bytes_per_frame = audio_seg.sample_width * audio_seg.channels
-                    chunk_byte_length = chunk_size * bytes_per_frame
-                    data_chunk = audio_seg.raw_data[offset:offset+chunk_byte_length]
-                    if len(data_chunk) < chunk_byte_length:
-                        data_chunk += b'\x00' * (chunk_byte_length - len(data_chunk))
-                        segments_to_remove.append(segment)
-                    # Convert the chunk to a numpy array (assuming 16-bit samples)
-                    chunk_array = np.frombuffer(data_chunk, dtype=np.int16)
-                    if mixed_chunk is None:
-                        mixed_chunk = chunk_array.astype(np.int32)
-                    else:
-                        mixed_chunk += chunk_array.astype(np.int32)
-                    # Update offset for this segment
-                    segment['offset'] += chunk_byte_length
-                # Remove finished segments
-                for seg in segments_to_remove:
-                    active_audio_segments.remove(seg)
-                if mixed_chunk is not None:
-                    # Clip to int16 range and write to stream
-                    mixed_chunk = np.clip(mixed_chunk, -32768, 32767).astype(np.int16)
-                    stream.write(mixed_chunk.tobytes())
-        # Small sleep to yield CPU if needed
-        time.sleep(0.001)
+stream = pa.open(
+    format=pa.get_format_from_width(sample_width),
+    channels=channels,
+    rate=rate,
+    output=True,
+    frames_per_buffer=64,  # Reduced buffer size for lower latency
+    stream_callback=audio_callback
+)
+stream.start_stream()
 
 def on_press(key):
     """
@@ -139,13 +136,11 @@ def on_release(key):
     if key == Key.esc:
         return False  # 리스너 종료
 
-# Start the mixer thread
-mixer = threading.Thread(target=mixer_thread, daemon=True)
-mixer.start()
-
 # 키보드 이벤트 리스너 시작
 with Listener(on_press=on_press, on_release=on_release) as listener:
     listener.join()
 
 # 프로그램 종료 후 자원 정리
+stream.stop_stream()
+stream.close()
 pa.terminate()
